@@ -1,14 +1,14 @@
-// static/main.js — extended: transcription streaming, summarizer, adaptation, attention
+// static/main.js — final integrated: transcription, summarizer, adaptation, attention
 document.addEventListener('DOMContentLoaded', () => {
   const socket = io();
-  const pcs = {};              // map: remoteSid -> RTCPeerConnection
+  const pcs = {};
   let localStream = null;
   let joined = false;
   let room = null;
-  const statsIntervals = {};   // map remoteSid -> interval id
+  const statsIntervals = {};
   let recorder = null;
+  let attentionInterval = null;
 
-  // ICE config: STUN + TURN (replace with your TURN provider for production)
   const config = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -20,7 +20,7 @@ document.addEventListener('DOMContentLoaded', () => {
     ]
   };
 
-  // DOM
+  // DOM refs
   const joinBtn = document.getElementById('joinBtn');
   const leaveBtn = document.getElementById('leaveBtn');
   const roomInput = document.getElementById('roomInput');
@@ -37,16 +37,18 @@ document.addEventListener('DOMContentLoaded', () => {
   const attScoreEl = document.getElementById('attScore');
   const localBadge = document.getElementById('localBadge');
 
-  function clog(...a){ console.log('[APP]', ...a); debugEl.innerText = debugEl.innerText + a.join(' ') + '\n'; }
+  function clog(...a) {
+    console.log('[APP]', ...a);
+    debugEl.innerText += a.join(' ') + '\n';
+  }
 
-  // Socket handlers
+  // ---------- Socket Handlers ----------
   socket.on('connect', () => {
     clog('socket connected', socket.id);
     joinBtn.disabled = false;
   });
 
   socket.on('existing-peers', (data) => {
-    clog('existing peers', data.peers);
     if (Array.isArray(data.peers)) {
       data.peers.forEach(p => addParticipant(p));
     }
@@ -54,7 +56,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   socket.on('new-peer', async (data) => {
     const newSid = data.peer;
-    clog('new-peer -> create offer to', newSid);
     addParticipant(newSid);
     await createPeerAndOffer(newSid);
   });
@@ -62,129 +63,75 @@ document.addEventListener('DOMContentLoaded', () => {
   socket.on('offer', async (data) => {
     const from = data.from;
     const sdp = data.sdp;
-    clog('offer received from', from);
     if (!pcs[from]) createPeerConnectionFor(from);
     const pc = pcs[from];
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    } catch (e) {
-      clog('setRemoteDescription failed', e);
-      return;
-    }
-
-    // Ensure local stream is available before answering
-    if (!localStream) {
-      try {
+      if (!localStream) {
         localStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
         localVideo.srcObject = localStream;
-        leaveBtn.disabled = false;
-      } catch(e) {
-        alert('Camera/mic permission needed: ' + e.message);
-        return;
       }
-    }
-
-    // Add local tracks if not already
-    const existingTracks = pc.getSenders().map(s => s.track).filter(Boolean);
-    localStream.getTracks().forEach(t => {
-      if (!existingTracks.includes(t)) pc.addTrack(t, localStream);
-    });
-
-    // Create answer
-    try {
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('answer', { to: from, sdp: pc.localDescription });
-      clog('sent answer to', from);
-    } catch (err) {
-      console.error('Error creating/sending answer', err);
-    }
+    } catch (e) { clog('offer handling failed', e); }
   });
 
   socket.on('answer', async (data) => {
-    const from = data.from;
-    const sdp = data.sdp;
-    clog('answer received from', from);
-    const pc = pcs[from];
+    const pc = pcs[data.from];
     if (pc) {
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      } catch (e) {
-        console.warn('setRemoteDescription (answer) failed', e);
-      }
-    } else {
-      console.warn('No pc for', from);
+      try { await pc.setRemoteDescription(new RTCSessionDescription(data.sdp)); }
+      catch (e) { clog('answer setRemoteDescription failed', e); }
     }
   });
 
   socket.on('ice-candidate', async (data) => {
-    const from = data.from;
-    const candidate = data.candidate;
-    const pc = pcs[from];
-    if (pc && candidate) {
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (e) {
-        console.warn('Failed to add ICE', e);
-      }
+    const pc = pcs[data.from];
+    if (pc && data.candidate) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); }
+      catch (e) { clog('addIceCandidate failed', e); }
     }
   });
 
   socket.on('peer-left', (data) => {
-    const sid = data.sid;
-    clog('peer-left', sid);
-    removePeer(sid);
-    removeParticipant(sid);
+    removePeer(data.sid);
+    removeParticipant(data.sid);
   });
 
-  // transcript updates from server
   socket.on('transcript-update', (data) => {
-    const entry = data.entry;
-    const p = document.createElement('p');
-    const ts = entry.ts ? new Date(entry.ts * 1000) : new Date();
-    p.innerText = `[${ts.toLocaleTimeString()}] ${entry.text}`;
-    transcriptBox.appendChild(p);
-    transcriptBox.scrollTop = transcriptBox.scrollHeight;
+    appendTranscript(data.entry);
   });
 
-  // Join room
+  socket.on('attention-update', (data) => {
+    clog(`Attention from ${data.sid}: ${Math.round(data.score * 100)}%`);
+  });
+
+  // ---------- Join / Leave ----------
   joinBtn.onclick = async () => {
     if (joined) return;
     room = (roomInput.value || 'default').trim();
-
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
       localVideo.srcObject = localStream;
-      leaveBtn.disabled = false;
       localBadge.innerText = 'Live';
-      localBadge.classList.remove('muted');
-    } catch (e) {
-      alert('Camera/mic required: ' + e.message);
-      return;
-    }
+    } catch (e) { return alert('Camera/mic required: ' + e.message); }
 
     socket.emit('join', { room });
     joined = true;
     joinBtn.disabled = true;
-    clog('joined', room);
-
-    // Add local participant row
+    leaveBtn.disabled = false;
     addParticipant('you', { label: 'You', self: true });
-
-    // Start streaming audio chunks for transcription
     startAudioStreaming();
+    startClientSpeechRecognition();
+    startAttentionMeter();
   };
 
-  // Leave room
   leaveBtn.onclick = () => {
     if (!joined) return;
     socket.emit('leave', { room });
-    // cleanup all
     Object.keys(pcs).forEach(removePeer);
-    if (localStream) {
-      localStream.getTracks().forEach(t => t.stop());
-      localStream = null;
-    }
+    if (localStream) localStream.getTracks().forEach(t => t.stop());
     localVideo.srcObject = null;
     joined = false;
     joinBtn.disabled = false;
@@ -193,42 +140,26 @@ document.addEventListener('DOMContentLoaded', () => {
     transcriptBox.innerHTML = '';
     summaryBox.innerText = '';
     stopAudioStreaming();
+    stopAttentionMeter();
     localBadge.innerText = 'Muted';
-    localBadge.classList.add('muted');
   };
 
-  // Peer connection helpers
+  // ---------- Peer Helpers ----------
   function createPeerConnectionFor(remoteSid) {
     const pc = new RTCPeerConnection(config);
     pcs[remoteSid] = pc;
-
     pc.onicecandidate = (ev) => {
-      if (ev.candidate) {
-        socket.emit('ice-candidate', { to: remoteSid, candidate: ev.candidate });
-      }
+      if (ev.candidate) socket.emit('ice-candidate', { to: remoteSid, candidate: ev.candidate });
     };
-
-    pc.ontrack = (ev) => {
-      clog('ontrack from', remoteSid);
-      attachRemoteStream(remoteSid, ev.streams[0]);
-    };
-
+    pc.ontrack = (ev) => attachRemoteStream(remoteSid, ev.streams[0]);
     pc.onconnectionstatechange = () => {
-      clog('pc state', remoteSid, pc.connectionState);
-      if (pc.connectionState === 'connected') {
-        startStatsFor(remoteSid);
-      }
+      if (pc.connectionState === 'connected') startStatsFor(remoteSid);
       if (['disconnected','failed','closed'].includes(pc.connectionState)) {
         removePeer(remoteSid);
         removeParticipant(remoteSid);
       }
     };
-
-    // add local tracks if available
-    if (localStream) {
-      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-    }
-
+    if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
     return pc;
   }
 
@@ -238,182 +169,41 @@ document.addEventListener('DOMContentLoaded', () => {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socket.emit('offer', { to: targetSid, sdp: pc.localDescription });
-      clog('offer sent to', targetSid);
-    } catch (e) {
-      console.error('Offer error', e);
-    }
+    } catch (e) { clog('Offer error', e); }
   }
 
-  // Attach remote stream into a tile
   function attachRemoteStream(remoteSid, stream) {
-    let wrapper = document.getElementById('wrap_' + remoteSid);
-    let vid;
-    if (!wrapper) {
-      wrapper = document.createElement('div');
+    let vid = document.getElementById('remote_' + remoteSid);
+    if (!vid) {
+      const wrapper = document.createElement('div');
       wrapper.id = 'wrap_' + remoteSid;
       wrapper.className = 'video-tile';
       vid = document.createElement('video');
       vid.id = 'remote_' + remoteSid;
-      vid.autoplay = true;
-      vid.playsInline = true;
+      vid.autoplay = true; vid.playsInline = true;
       wrapper.appendChild(vid);
-
-      const footer = document.createElement('div');
-      footer.className = 'tile-footer';
-      const nameDiv = document.createElement('div');
-      nameDiv.className = 'name';
-      nameDiv.innerText = `Peer: ${shortId(remoteSid)}`;
-      const metaDiv = document.createElement('div');
-      metaDiv.className = 'meta';
-      const badge = document.createElement('span');
-      badge.className = 'badge';
-      badge.innerText = 'Remote';
-      metaDiv.appendChild(badge);
-
-      footer.appendChild(nameDiv);
-      footer.appendChild(metaDiv);
-      wrapper.appendChild(footer);
-
       remotesGrid.appendChild(wrapper);
       addParticipant(remoteSid);
-    } else {
-      vid = document.getElementById('remote_' + remoteSid);
     }
-
-    try {
-      vid.srcObject = stream;
-    } catch (e) {
-      vid.src = URL.createObjectURL(stream);
-    }
+    vid.srcObject = stream;
   }
 
   function removePeer(remoteSid) {
-    const pc = pcs[remoteSid];
-    if (pc) {
-      try { pc.close(); } catch(e) {}
-      delete pcs[remoteSid];
-    }
-    if (statsIntervals[remoteSid]) {
-      clearInterval(statsIntervals[remoteSid]);
-      delete statsIntervals[remoteSid];
-    }
+    if (pcs[remoteSid]) { try { pcs[remoteSid].close(); } catch(e){} delete pcs[remoteSid]; }
+    if (statsIntervals[remoteSid]) { clearInterval(statsIntervals[remoteSid]); delete statsIntervals[remoteSid]; }
     const wrapper = document.getElementById('wrap_' + remoteSid);
     if (wrapper) wrapper.remove();
   }
 
-  // Participants list utils
-  function addParticipant(id, opts = {}) {
-    if (!participantsList) return;
-    const placeholder = participantsList.querySelector('.placeholder');
-    if (placeholder) placeholder.remove();
-    if (document.getElementById('part_' + id)) return;
-
-    const li = document.createElement('li');
-    li.id = 'part_' + id;
-    const dot = document.createElement('span');
-    dot.className = 'dot';
-    li.appendChild(dot);
-
-    const txt = document.createElement('div');
-    txt.style.display = 'flex';
-    txt.style.flexDirection = 'column';
-    const title = document.createElement('strong');
-    title.style.fontSize = '13px';
-    title.innerText = opts.label || (id === 'you' ? 'You' : shortId(id));
-    const sub = document.createElement('span');
-    sub.style.fontSize = '12px';
-    sub.style.color = 'rgba(230,238,248,0.6)';
-    sub.innerText = opts.self ? 'Local' : 'Remote';
-    txt.appendChild(title);
-    txt.appendChild(sub);
-
-    li.appendChild(txt);
-    participantsList.appendChild(li);
+  // ---------- Transcript & Summary ----------
+  function appendTranscript(entry) {
+    const p = document.createElement('p');
+    const ts = entry.ts ? new Date(entry.ts * 1000) : new Date();
+    p.innerText = `[${ts.toLocaleTimeString()}] ${entry.text}`;
+    transcriptBox.appendChild(p);
+    transcriptBox.scrollTop = transcriptBox.scrollHeight;
   }
 
-  function removeParticipant(id) {
-    const el = document.getElementById('part_' + id);
-    if (el) el.remove();
-    if (participantsList.children.length === 0) {
-      const p = document.createElement('li');
-      p.className = 'placeholder';
-      p.innerText = 'No participants yet';
-      participantsList.appendChild(p);
-    }
-  }
-
-  function clearParticipants() {
-    participantsList.innerHTML = '';
-    const p = document.createElement('li');
-    p.className = 'placeholder';
-    p.innerText = 'No participants yet';
-    participantsList.appendChild(p);
-  }
-
-  function shortId(id) {
-    if (!id) return '';
-    return id.length > 8 ? id.slice(0,8) : id;
-  }
-
-  // Stats & adaptation: start per peer
-  function startStatsFor(remoteSid) {
-    if (statsIntervals[remoteSid]) return;
-    const pc = pcs[remoteSid];
-    statsIntervals[remoteSid] = setInterval(async () => {
-      if (!pc || pc.connectionState !== 'connected') return;
-      const stats = await pc.getStats();
-      let rttMs = null, packetsReceived = 0, packetsLost = 0;
-      stats.forEach(report => {
-        if (report.type === 'candidate-pair' && (report.state === 'succeeded' || report.selected)) {
-          if (report.currentRoundTripTime) rttMs = report.currentRoundTripTime * 1000;
-          else if (report.roundTripTime) rttMs = report.roundTripTime * 1000;
-        }
-        if (report.type === 'inbound-rtp' && (report.kind === 'video' || !report.kind)) {
-          packetsReceived = report.packetsReceived || packetsReceived;
-          packetsLost = report.packetsLost || packetsLost;
-        }
-      });
-      rttEl.innerText = rttMs ? Math.round(rttMs) : '—';
-      const lossPct = packetsReceived + packetsLost ? Math.round((packetsLost / (packetsReceived + packetsLost)) * 10000)/100 : 0;
-      plEl.innerText = lossPct ? lossPct + '%' : '—';
-      // Call adaptation endpoint
-      checkNetworkAdaptation(rttMs || 0, packetsLost / (packetsReceived + packetsLost + 0.001));
-    }, 3000);
-  }
-
-  // Adaptation backend call: /adapt
-  async function checkNetworkAdaptation(rtt, packetLoss, bandwidth = 600) {
-    try {
-      const res = await fetch('/adapt', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rtt, packetLoss, bandwidth })
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      netModeEl.innerText = data.mode || 'normal';
-
-      // enact local adaptation decisions
-      if (!localStream) return;
-      if (data.mode === 'degrade-video') {
-        localStream.getVideoTracks().forEach(t => {
-          try { t.applyConstraints({ frameRate: 10, height: 240 }); } catch(e){ clog('constraint apply failed', e); }
-        });
-      } else if (data.mode === 'audio-only') {
-        localStream.getVideoTracks().forEach(t => t.enabled = false);
-      } else if (data.mode === 'captions-only') {
-        // stop all tracks but keep recorder for transcription if needed
-        localStream.getTracks().forEach(t => t.stop());
-      } else {
-        // normal: ensure video enabled
-        localStream.getVideoTracks().forEach(t => t.enabled = true);
-      }
-    } catch (e) {
-      console.warn('adaptation check failed', e);
-    }
-  }
-
-  // Summarizer: POST /summarize
   summarizeBtn.onclick = async () => {
     if (!room) return alert('Join a room first');
     summaryBox.innerText = 'Generating summary...';
@@ -423,44 +213,85 @@ document.addEventListener('DOMContentLoaded', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ room })
       });
-      if (!res.ok) {
-        summaryBox.innerText = 'Summary failed';
-        return;
-      }
       const data = await res.json();
-      const s = data.result && data.result.summary ? data.result.summary : (data.result || 'No summary');
-      summaryBox.innerText = s;
-    } catch (e) {
-      summaryBox.innerText = 'Summary error: ' + e.message;
-    }
+      summaryBox.innerText = data.result?.summary || data.result || 'No summary';
+    } catch (e) { summaryBox.innerText = 'Summary error: ' + e.message; }
   };
 
-  // Attention poll (GET /attention/<socket.id>)
-  async function pollAttention() {
-    if (!room) return;
+  // ---------- Attention ----------
+  function startAttentionMeter() {
     try {
-      const res = await fetch(`/attention/${socket.id}`);
-      if (!res.ok) return;
-      const data = await res.json();
-      const score = data.attention && (data.attention.score || data.attention.score === 0) ? data.attention.score : null;
-      attScoreEl.innerText = score !== null ? Math.round(score * 100) + '%' : '—';
-    } catch (e) {}
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = audioCtx.createMediaStreamSource(localStream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      src.connect(analyser);
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      attentionInterval = setInterval(() => {
+        analyser.getByteTimeDomainData(dataArray);
+        let sum = 0; for (let i=0;i<dataArray.length;i++){ const v=(dataArray[i]-128)/128; sum+=v*v; }
+        const rms = Math.sqrt(sum / dataArray.length);
+        const score = Math.min(1, Math.max(0, (rms-0.02)*2));
+        attScoreEl.innerText = Math.round(score*100) + '%';
+        socket.emit('attention', { room, score });
+      }, 3000);
+    } catch(e){ clog('Attention meter failed', e); }
   }
-  setInterval(pollAttention, 5000);
+  function stopAttentionMeter(){ if(attentionInterval) clearInterval(attentionInterval); }
 
-  // Audio streaming for transcription: MediaRecorder to server via socket.io "audio-chunk"
+  // ---------- Network Adaptation ----------
+  function startStatsFor(remoteSid) {
+    if (statsIntervals[remoteSid]) return;
+    const pc = pcs[remoteSid];
+    statsIntervals[remoteSid] = setInterval(async () => {
+      if (!pc || pc.connectionState !== 'connected') return;
+      const stats = await pc.getStats();
+      let rttMs=0, rec=0, lost=0;
+      stats.forEach(r => {
+        if (r.type==='candidate-pair' && (r.state==='succeeded'||r.selected)) {
+          if (r.currentRoundTripTime) rttMs = r.currentRoundTripTime*1000;
+        }
+        if (r.type==='inbound-rtp' && r.kind==='video') {
+          rec += r.packetsReceived||0; lost += r.packetsLost||0;
+        }
+      });
+      rttEl.innerText = rttMs?Math.round(rttMs):'—';
+      const loss = rec+lost? lost/(rec+lost):0;
+      plEl.innerText = loss? Math.round(loss*100)+'%':'—';
+      checkNetworkAdaptation(rttMs, loss);
+    }, 5000);
+  }
+
+  async function checkNetworkAdaptation(rtt, packetLoss, bandwidth=600) {
+    try {
+      const res = await fetch('/adapt', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ rtt, packetLoss, bandwidth })
+      });
+      const data = await res.json();
+      netModeEl.innerText = data.mode || 'normal';
+      if (!localStream) return;
+      if (data.mode==='degrade-video') {
+        localStream.getVideoTracks().forEach(t => t.applyConstraints({frameRate:10,height:240}));
+      } else if (data.mode==='audio-only') {
+        localStream.getVideoTracks().forEach(t => t.enabled=false);
+      } else if (data.mode==='captions-only') {
+        localStream.getTracks().forEach(t => t.stop());
+      } else {
+        localStream.getVideoTracks().forEach(t => t.enabled=true);
+      }
+    } catch(e){ clog('adaptation error', e); }
+  }
+
+  // ---------- Audio Streaming ----------
   function startAudioStreaming() {
     if (!localStream) return;
     try {
       const audioStream = new MediaStream(localStream.getAudioTracks());
-      recorder = new MediaRecorder(audioStream, { mimeType: 'audio/webm' });
-    } catch (e) {
-      clog('MediaRecorder init failed', e);
-      return;
-    }
-
+      recorder = new MediaRecorder(audioStream, { mimeType:'audio/webm' });
+    } catch(e){ return clog('MediaRecorder init failed', e); }
     recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) {
+      if (e.data && e.data.size>0) {
         const reader = new FileReader();
         reader.onload = () => {
           const b64 = reader.result.split(',')[1];
@@ -469,34 +300,43 @@ document.addEventListener('DOMContentLoaded', () => {
         reader.readAsDataURL(e.data);
       }
     };
+    recorder.start(3000);
+  }
+  function stopAudioStreaming(){ if(recorder&&recorder.state!=='inactive') recorder.stop(); }
 
-    recorder.onerror = (ev) => clog('recorder error', ev);
-    recorder.start(3000); // emit every 3s
-    clog('audio streaming started');
+  // ---------- Client SpeechRecognition ----------
+  function startClientSpeechRecognition() {
+    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) return;
+    const SR = window.SpeechRecognition||window.webkitSpeechRecognition;
+    const recog = new SR();
+    recog.lang='en-US'; recog.continuous=true; recog.interimResults=true;
+    recog.onresult = (evt) => {
+      for (let i=evt.resultIndex;i<evt.results.length;i++){
+        const res=evt.results[i];
+        if(res.isFinal){
+          const text=res[0].transcript.trim();
+          const payload={ room, text, ts:Math.floor(Date.now()/1000) };
+          socket.emit('transcript-text', payload);
+          appendTranscript(payload);
+        }
+      }
+    };
+    recog.onerror=(e)=>clog('SpeechRecog err', e);
+    recog.onend=()=>{ try{recog.start();}catch(e){} };
+    try{ recog.start(); }catch(e){ clog('SpeechRecog start failed', e); }
   }
 
-  function stopAudioStreaming() {
-    try {
-      if (recorder && recorder.state !== 'inactive') recorder.stop();
-      recorder = null;
-      clog('audio streaming stopped');
-    } catch (e) { clog('stopAudioStreaming err', e); }
+  // ---------- Participants UI ----------
+  function addParticipant(id, opts={}) {
+    if (!participantsList) return;
+    if (document.getElementById('part_'+id)) return;
+    const li=document.createElement('li'); li.id='part_'+id;
+    li.innerText=opts.label|| (id==='you'?'You':shortId(id));
+    participantsList.appendChild(li);
   }
+  function removeParticipant(id){ const el=document.getElementById('part_'+id); if(el) el.remove(); }
+  function clearParticipants(){ participantsList.innerHTML='<li class="placeholder">No participants</li>'; }
+  function shortId(id){ return id? id.slice(0,8):''; }
 
-  // Utility to stop everything & cleanup
-  function stopAll() {
-    stopAudioStreaming();
-    Object.keys(pcs).forEach(removePeer);
-    if (localStream) {
-      localStream.getTracks().forEach(t => t.stop());
-      localStream = null;
-      localVideo.srcObject = null;
-    }
-    transcriptBox.innerHTML = '';
-    summaryBox.innerText = '';
-  }
-
-  // Exported helpers (for debug)
-  window._agamai = { pcs, stopAll };
-
+  window._app={pcs, stopAll:()=>{stopAudioStreaming();stopAttentionMeter();}};
 });

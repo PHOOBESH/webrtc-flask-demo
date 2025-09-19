@@ -8,6 +8,7 @@ from collections import defaultdict
 import logging
 import threading
 import os
+import time
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("webrtc-signaling")
@@ -121,6 +122,28 @@ def handle_join(data):
             t = threading.Thread(target=audio_worker_for_room, args=(room, socketio), daemon=True)
             audio_workers[room] = t
             t.start()
+@socketio.on('transcript-text')
+def handle_transcript_text(data):
+    room = data.get('room', 'default')
+    text = data.get('text', '').strip()
+    ts = int(data.get('ts') or (time.time()))
+    if not text:
+        return
+    try:
+        from transcription import rooms as trans_rooms
+        if room not in trans_rooms:
+            trans_rooms[room] = {"transcript": [], "chunk_queue": None}
+        trans_rooms[room]["transcript"].append({"ts": ts, "text": text})
+    except Exception:
+        pass
+    socketio.emit('transcript-update', {"room": room, "entry": {"ts": ts, "text": text}}, room=room)
+
+@socketio.on('attention')
+def handle_attention(data):
+    room = data.get('room', 'default')
+    sid = request.sid
+    score = float(data.get('score', 0.0) or 0.0)
+    socketio.emit('attention-update', {"sid": sid, "score": score}, room=room)
 
 @socketio.on('offer')
 def handle_offer(data):
