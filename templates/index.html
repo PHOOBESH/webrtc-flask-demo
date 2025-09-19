@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebRTC 2-Participant Demo</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="card">
+    <h1>WebRTC 2-Participant (HTML + Python)</h1>
+
+    <div class="controls">
+      <input id="roomInput" placeholder="room name" value="testroom"/>
+      <button id="joinBtn">Join</button>
+      <button id="leaveBtn" disabled>Leave</button>
+    </div>
+
+    <div class="videos">
+      <div class="videoBlock">
+        <h4>Local</h4>
+        <video id="localVideo" autoplay muted playsinline></video>
+      </div>
+      <div class="videoBlock">
+        <h4>Remote</h4>
+        <video id="remoteVideo" autoplay playsinline></video>
+      </div>
+    </div>
+
+    <div class="stats">
+      <p>RTT: <span id="rtt">—</span> ms</p>
+      <p>Packet loss: <span id="pl">—</span> %</p>
+      <pre id="debug"></pre>
+    </div>
+  </div>
+
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+  <script src="/static/main.js"></script>
+</body>
+</html>
