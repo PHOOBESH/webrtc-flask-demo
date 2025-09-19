@@ -2,12 +2,12 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>WebRTC 2-Participant Demo</title>
+  <title>WebRTC Demo — AgamAI</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="card">
-    <h1>WebRTC 2-Participant (HTML + Python)</h1>
+  <div class="container">
+    <h1>WebRTC 2-Participant Demo (HTML + Python)</h1>
 
     <div class="controls">
       <input id="roomInput" placeholder="room name" value="testroom"/>
@@ -16,11 +16,11 @@
     </div>
 
     <div class="videos">
-      <div class="videoBlock">
+      <div>
         <h4>Local</h4>
         <video id="localVideo" autoplay muted playsinline></video>
       </div>
-      <div class="videoBlock">
+      <div>
         <h4>Remote</h4>
         <video id="remoteVideo" autoplay playsinline></video>
       </div>
@@ -29,10 +29,11 @@
     <div class="stats">
       <p>RTT: <span id="rtt">—</span> ms</p>
       <p>Packet loss: <span id="pl">—</span> %</p>
-      <pre id="debug"></pre>
+      <pre id="debug" style="max-height:120px;overflow:auto"></pre>
     </div>
   </div>
 
+  <!-- Socket.IO client (v4.x) -->
   <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
   <script src="/static/main.js"></script>
 </body>
