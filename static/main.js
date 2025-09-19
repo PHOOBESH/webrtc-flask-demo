@@ -1,245 +1,386 @@
-// static/main.js — robust, with TURN server (Metered.ca free relay)
+// static/main.js — multi-peer mesh client (updated: creates CSS-friendly tiles + participants list)
 document.addEventListener('DOMContentLoaded', () => {
-  // state
-  let joined = false;
   const socket = io();
-  let pc = null;
+  const pcs = {};              // map: remoteSid -> RTCPeerConnection
   let localStream = null;
+  let joined = false;
   let room = null;
-  let isInitiator = false;
   let statsInterval = null;
   let prevPacketsReceived = 0;
   let prevPacketsLost = 0;
 
-  // ✅ STUN + TURN servers
+  // ICE config: STUN + TURN (replace with your reliable TURN provider)
   const config = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    }
-  ]
-};
-  // helpers
-  function clog(...args) { console.log('[APP]', ...args); }
-  function sLog(...args) { console.log('[SOCKET]', ...args); }
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      // Example public relay (for testing). Replace with Xirsys/coturn creds for reliability.
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      }
+    ]
+  };
 
-  // DOM refs
+  // DOM (note: remotesGrid matches new HTML)
   const joinBtn = document.getElementById('joinBtn');
   const leaveBtn = document.getElementById('leaveBtn');
   const roomInput = document.getElementById('roomInput');
+  const localVideo = document.getElementById('localVideo');
+  const remotesGrid = document.getElementById('remotesGrid');
+  const participantsList = document.getElementById('participantsList');
+  const rttEl = document.getElementById('rtt');
+  const plEl = document.getElementById('pl');
+  const debugEl = document.getElementById('debug');
 
-  // socket events
+  // helper logs
+  function clog(...a){ console.log('[APP]', ...a); }
+
+  // --- socket handlers ---
   socket.on('connect', () => {
-    clog('Socket connected:', socket.id);
-    if (!joined) joinBtn.disabled = false;
-  });
-  socket.on('disconnect', (reason) => clog('Socket disconnected:', reason));
-  socket.on('connect_error', (err) => clog('Socket connect_error', err));
-
-  // server signals
-  socket.on('created', async () => {
-    clog('Server -> created (you are first in room)');
-    isInitiator = true;
-    await ensureLocalStream();
+    clog('socket connected', socket.id);
+    joinBtn.disabled = false;
   });
 
-  socket.on('ready', async () => {
-    clog('Server -> ready (2 peers)');
-    if (!localStream) await ensureLocalStream();
-
-    if (!pc) createPeerConnection();
-
-    // add tracks safely (avoid duplicates)
-    if (localStream && pc) {
-      const existingTracks = pc.getSenders().map(s => s.track).filter(Boolean);
-      localStream.getTracks().forEach(t => { if (!existingTracks.includes(t)) pc.addTrack(t, localStream); });
-    }
-
-    // only initiator creates offer
-    if (isInitiator && pc) {
-      try {
-        clog('Initiator -> createOffer');
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        sLog('emit offer');
-        socket.emit('offer', { sdp: pc.localDescription, room });
-      } catch (e) { console.error('Offer error', e); }
+  // Receive initial list of existing peers (optional)
+  socket.on('existing-peers', (data) => {
+    clog('existing peers', data.peers);
+    // optionally populate participants list
+    if (Array.isArray(data.peers)) {
+      data.peers.forEach(p => addParticipant(p));
     }
   });
 
+  // New peer joined -> we should create pc and offer to them
+  socket.on('new-peer', async (data) => {
+    const newSid = data.peer;
+    clog('new-peer -> create offer to', newSid);
+    addParticipant(newSid);
+    await createPeerAndOffer(newSid);
+  });
+
+  // Offer received from another peer
   socket.on('offer', async (data) => {
-    clog('Socket -> offer received');
-    if (!pc) createPeerConnection();
+    const from = data.from;
+    const sdp = data.sdp;
+    clog('offer received from', from);
+    if (!pcs[from]) createPeerConnectionFor(from);
+    const pc = pcs[from];
     try {
-      await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-      if (!localStream) await ensureLocalStream();
-      // add tracks before answering
-      localStream.getTracks().forEach(t => { try { pc.addTrack(t, localStream); } catch(e){} });
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    } catch (e) {
+      console.error('setRemoteDescription failed', e);
+      return;
+    }
+
+    // Ensure local stream is available before answering
+    if (!localStream) {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+        localVideo.srcObject = localStream;
+        leaveBtn.disabled = false;
+      } catch(e) {
+        alert('Camera/mic permission needed: ' + e.message);
+        return;
+      }
+    }
+
+    // Add local tracks if not already
+    const existingTracks = pc.getSenders().map(s => s.track).filter(Boolean);
+    localStream.getTracks().forEach(t => {
+      if (!existingTracks.includes(t)) pc.addTrack(t, localStream);
+    });
+
+    // Create answer
+    try {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      sLog('emit answer');
-      socket.emit('answer', { sdp: pc.localDescription, room });
-    } catch (err) { console.error('Handle offer error', err); }
+      socket.emit('answer', { to: from, sdp: pc.localDescription });
+      clog('sent answer to', from);
+    } catch (err) {
+      console.error('Error creating/sending answer', err);
+    }
   });
 
+  // Answer for an offer we sent
   socket.on('answer', async (data) => {
-    clog('Socket -> answer received');
-    try { await pc.setRemoteDescription(new RTCSessionDescription(data.sdp)); }
-    catch (err) { console.error('Set remote answer error', err); }
+    const from = data.from;
+    const sdp = data.sdp;
+    clog('answer received from', from);
+    const pc = pcs[from];
+    if (pc) {
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      } catch (e) {
+        console.warn('setRemoteDescription (answer) failed', e);
+      }
+    } else {
+      console.warn('No pc for', from);
+    }
   });
 
+  // ICE candidate routing
   socket.on('ice-candidate', async (data) => {
-    clog('Socket -> ice-candidate received');
-    try { if (pc && data.candidate) await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); }
-    catch (err) { console.warn('Add ICE candidate failed', err); }
+    const from = data.from;
+    const candidate = data.candidate;
+    const pc = pcs[from];
+    if (pc && candidate) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.warn('Failed to add ICE', e);
+      }
+    }
   });
 
-  // When another peer leaves, we clear the remote video and close the PC.
-  socket.on('peer-left', (payload) => {
-    clog('Socket -> peer-left', payload);
-    // clear remote view but keep local camera running so user can continue
-    document.getElementById('remoteVideo').srcObject = null;
-    if (pc) { try { pc.close(); } catch(e){} pc = null; }
-    if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
-    prevPacketsReceived = prevPacketsLost = 0;
-    // Leave DOES NOT modify `joined` here — user can re-join or leave locally.
+  // Peer left -> remove UI and pc
+  socket.on('peer-left', (data) => {
+    const sid = data.sid;
+    clog('peer-left', sid);
+    removePeer(sid);
+    removeParticipant(sid);
   });
 
-  // UI handlers
+  // --- UI handlers ---
   joinBtn.onclick = async () => {
-    if (joined) { clog('Already joined — ignoring'); return; }
+    if (joined) return;
     room = (roomInput.value || 'default').trim();
 
-    // wait for socket
-    if (!socket.connected) {
-      clog('Waiting for socket connection...');
-      await new Promise(res => {
-        const t = setInterval(() => { if (socket.connected) { clearInterval(t); res(); } }, 50);
-        // fallback timeout
-        setTimeout(() => { clearInterval(t); res(); }, 3000);
-      });
+    // get local stream proactively
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+      localVideo.srcObject = localStream;
+      leaveBtn.disabled = false;
+    } catch (e) {
+      alert('Camera/mic required: ' + e.message);
+      return;
     }
 
-    sLog('emit join', room);
     socket.emit('join', { room });
     joined = true;
     joinBtn.disabled = true;
+    clog('joined', room);
+
+    // mark self in participants list
+    addParticipant('you', { label: 'You', self: true });
   };
 
-  // user clicks leave -> stop local only (server notifies others)
   leaveBtn.onclick = () => {
-    if (room) {
-      sLog('emit leave', room);
-      socket.emit('leave', { room });
-    }
-    stopLocalAndReset();
-  };
-
-  // media & PC helpers
-  async function ensureLocalStream() {
-    if (localStream) return;
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      document.getElementById('localVideo').srcObject = localStream;
-      leaveBtn.disabled = false;
-      clog('Local stream started');
-    } catch (err) {
-      alert('Camera/microphone error: ' + err.message);
-      clog('getUserMedia failed', err);
-      joinBtn.disabled = false;
-      joined = false;
-    }
-  }
-
-  function createPeerConnection() {
-    clog('Creating RTCPeerConnection');
-    pc = new RTCPeerConnection(config);
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) { sLog('emit ice-candidate'); socket.emit('ice-candidate', { candidate: event.candidate, room }); }
-    };
-
-    pc.ontrack = (ev) => {
-      clog('ontrack -> set remote');
-      document.getElementById('remoteVideo').srcObject = ev.streams[0];
-    };
-
-    pc.onconnectionstatechange = () => {
-      clog('PC connectionState', pc.connectionState);
-      if (pc.connectionState === 'connected') startStats();
-      if (['disconnected','failed','closed'].includes(pc.connectionState)) stopCallAndKeepLocal();
-    };
-
-    pc.oniceconnectionstatechange = () => clog('PC iceConnectionState', pc.iceConnectionState);
-  }
-
-  function startStats() {
-    if (statsInterval) clearInterval(statsInterval);
-    statsInterval = setInterval(async () => {
-      if (!pc || pc.connectionState !== 'connected') return;
-      const stats = await pc.getStats();
-      parseAndShowStats(stats);
-    }, 1000);
-  }
-
-  function parseAndShowStats(stats) {
-    let rttMs = null, packetsReceived = 0, packetsLost = 0;
-    stats.forEach(report => {
-      if (report.type === 'candidate-pair' && (report.state === 'succeeded' || report.selected)) {
-        if (report.currentRoundTripTime) rttMs = report.currentRoundTripTime * 1000;
-        else if (report.roundTripTime) rttMs = report.roundTripTime * 1000;
-      }
-      if (report.type === 'inbound-rtp' && (report.kind === 'video' || !report.kind)) {
-        packetsReceived = report.packetsReceived || packetsReceived;
-        packetsLost = report.packetsLost || packetsLost;
-      }
-    });
-
-    let plPercent = '—';
-    if (prevPacketsReceived || prevPacketsLost) {
-      const dRecv = Math.max(0, (packetsReceived - prevPacketsReceived) || 0);
-      const dLost = Math.max(0, (packetsLost - prevPacketsLost) || 0);
-      const total = dRecv + dLost;
-      plPercent = (total > 0) ? ((dLost / total) * 100).toFixed(1) : '0.0';
-    }
-    prevPacketsReceived = packetsReceived; prevPacketsLost = packetsLost;
-
-    document.getElementById('rtt').innerText = rttMs ? Math.round(rttMs) : '—';
-    document.getElementById('pl').innerText = (plPercent !== '—') ? (plPercent + '%') : '—';
-    try { document.getElementById('debug').innerText = `inbound packets: ${packetsReceived}, lost: ${packetsLost}`; } catch(e){}
-  }
-
-  // stop both PC and local stream (user leaves completely)
-  function stopLocalAndReset() {
-    clog('stopLocalAndReset');
-    if (pc) { try { pc.close(); } catch(e){} pc = null; }
+    if (!joined) return;
+    socket.emit('leave', { room });
+    // cleanup all
+    Object.keys(pcs).forEach(removePeer);
     if (localStream) {
       localStream.getTracks().forEach(t => t.stop());
       localStream = null;
-      document.getElementById('localVideo').srcObject = null;
     }
-    document.getElementById('remoteVideo').srcObject = null;
-    if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
-    prevPacketsReceived = prevPacketsLost = 0;
-    joinBtn.disabled = false; leaveBtn.disabled = true;
-    joined = false; room = null; isInitiator = false;
+    localVideo.srcObject = null;
+    joined = false;
+    joinBtn.disabled = false;
+    leaveBtn.disabled = true;
+    // remove participants (except 'you' entry if desired)
+    clearParticipants();
+  };
+
+  // --- Peer connection helpers ---
+  function createPeerConnectionFor(remoteSid) {
+    const pc = new RTCPeerConnection(config);
+    pcs[remoteSid] = pc;
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) {
+        socket.emit('ice-candidate', { to: remoteSid, candidate: ev.candidate });
+      }
+    };
+
+    pc.ontrack = (ev) => {
+      clog('ontrack from', remoteSid);
+      attachRemoteStream(remoteSid, ev.streams[0]);
+    };
+
+    pc.onconnectionstatechange = () => {
+      clog('pc state', remoteSid, pc.connectionState);
+      if (pc.connectionState === 'connected') {
+        startStatsFor(remoteSid);
+      }
+      if (['disconnected','failed','closed'].includes(pc.connectionState)) {
+        removePeer(remoteSid);
+        removeParticipant(remoteSid);
+      }
+    };
+
+    // add local tracks if available
+    if (localStream) {
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    }
+
+    return pc;
   }
 
-  // stop call but keep local stream running (peer disconnected or PC failed)
-  function stopCallAndKeepLocal() {
-    clog('stopCallAndKeepLocal');
-    if (pc) { try { pc.close(); } catch(e){} pc = null; }
-    document.getElementById('remoteVideo').srcObject = null;
-    if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
-    prevPacketsReceived = prevPacketsLost = 0;
-    // do NOT change `joined` or localStream so user can attempt re-negotiate or re-join
+  async function createPeerAndOffer(targetSid) {
+    const pc = createPeerConnectionFor(targetSid);
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('offer', { to: targetSid, sdp: pc.localDescription });
+      clog('offer sent to', targetSid);
+    } catch (e) {
+      console.error('Offer error', e);
+    }
   }
+
+  // --- UI: create tiles & participants list (matches CSS) ---
+  function attachRemoteStream(remoteSid, stream) {
+    // ensure wrapper exists and has classes that match style.css
+    let wrapper = document.getElementById('wrap_' + remoteSid);
+    let vid;
+    if (!wrapper) {
+      wrapper = document.createElement('div');
+      wrapper.id = 'wrap_' + remoteSid;
+      wrapper.className = 'video-tile';
+      // create video element
+      vid = document.createElement('video');
+      vid.id = 'remote_' + remoteSid;
+      vid.autoplay = true;
+      vid.playsInline = true;
+      // append video
+      wrapper.appendChild(vid);
+
+      // tile footer
+      const footer = document.createElement('div');
+      footer.className = 'tile-footer';
+      // name
+      const nameDiv = document.createElement('div');
+      nameDiv.className = 'name';
+      nameDiv.innerText = `Peer: ${shortId(remoteSid)}`;
+      // meta (badge)
+      const metaDiv = document.createElement('div');
+      metaDiv.className = 'meta';
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.innerText = 'Remote';
+      metaDiv.appendChild(badge);
+
+      footer.appendChild(nameDiv);
+      footer.appendChild(metaDiv);
+      wrapper.appendChild(footer);
+
+      // append to grid (after local tile)
+      remotesGrid.appendChild(wrapper);
+
+      // add participant entry
+      addParticipant(remoteSid);
+    } else {
+      vid = document.getElementById('remote_' + remoteSid);
+    }
+
+    // set stream
+    try {
+      vid.srcObject = stream;
+    } catch (e) {
+      // fallback: create object URL (older browsers)
+      vid.src = URL.createObjectURL(stream);
+    }
+  }
+
+  function removePeer(remoteSid) {
+    const pc = pcs[remoteSid];
+    if (pc) {
+      try { pc.close(); } catch(e) {}
+      delete pcs[remoteSid];
+    }
+    // clear interval if exists
+    if (statsIntervals[remoteSid]) {
+      clearInterval(statsIntervals[remoteSid]);
+      delete statsIntervals[remoteSid];
+    }
+    const wrapper = document.getElementById('wrap_' + remoteSid);
+    if (wrapper) wrapper.remove();
+  }
+
+  // --- Participants list utilities ---
+  function addParticipant(id, opts = {}) {
+    // opts: { label: string, self: bool }
+    if (!participantsList) return;
+    // Remove placeholder if present
+    const placeholder = participantsList.querySelector('.placeholder');
+    if (placeholder) placeholder.remove();
+
+    // Avoid duplicate entry
+    if (document.getElementById('part_' + id)) return;
+
+    const li = document.createElement('li');
+    li.id = 'part_' + id;
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    li.appendChild(dot);
+
+    const txt = document.createElement('div');
+    txt.style.display = 'flex';
+    txt.style.flexDirection = 'column';
+    const title = document.createElement('strong');
+    title.style.fontSize = '13px';
+    title.innerText = opts.label || (id === 'you' ? 'You' : shortId(id));
+    const sub = document.createElement('span');
+    sub.style.fontSize = '12px';
+    sub.style.color = 'rgba(230,238,248,0.6)';
+    sub.innerText = opts.self ? 'Local' : 'Remote';
+    txt.appendChild(title);
+    txt.appendChild(sub);
+
+    li.appendChild(txt);
+    participantsList.appendChild(li);
+  }
+
+  function removeParticipant(id) {
+    const el = document.getElementById('part_' + id);
+    if (el) el.remove();
+    // if list empty, add placeholder
+    if (participantsList.children.length === 0) {
+      const p = document.createElement('li');
+      p.className = 'placeholder';
+      p.innerText = 'No participants yet';
+      participantsList.appendChild(p);
+    }
+  }
+
+  function clearParticipants() {
+    participantsList.innerHTML = '';
+    const p = document.createElement('li');
+    p.className = 'placeholder';
+    p.innerText = 'No participants yet';
+    participantsList.appendChild(p);
+  }
+
+  // --- small helpers ---
+  function shortId(id) {
+    if (!id) return '';
+    return id.length > 8 ? id.slice(0,8) : id;
+  }
+
+  // --------- Basic stats per connection (optional) ----------
+  const statsIntervals = {}; // map remoteSid -> interval
+
+  function startStatsFor(remoteSid) {
+    if (statsIntervals[remoteSid]) return;
+    const pc = pcs[remoteSid];
+    statsIntervals[remoteSid] = setInterval(async () => {
+      if (!pc || pc.connectionState !== 'connected') return;
+      const stats = await pc.getStats();
+      let rttMs = null, packetsReceived = 0, packetsLost = 0;
+      stats.forEach(report => {
+        if (report.type === 'candidate-pair' && (report.state === 'succeeded' || report.selected)) {
+          if (report.currentRoundTripTime) rttMs = report.currentRoundTripTime * 1000;
+          else if (report.roundTripTime) rttMs = report.roundTripTime * 1000;
+        }
+        if (report.type === 'inbound-rtp' && (report.kind === 'video' || !report.kind)) {
+          packetsReceived = report.packetsReceived || packetsReceived;
+          packetsLost = report.packetsLost || packetsLost;
+        }
+      });
+      rttEl.innerText = rttMs ? Math.round(rttMs) : '—';
+      debugEl.innerText = `peer ${shortId(remoteSid)} inbound:${packetsReceived} lost:${packetsLost}`;
+    }, 1000);
+  }
+
 });
