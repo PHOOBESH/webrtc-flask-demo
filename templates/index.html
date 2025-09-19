@@ -41,11 +41,11 @@
             <video id="localVideo" autoplay muted playsinline></video>
             <div class="tile-footer">
               <div class="name">You</div>
-              <div class="meta">Local • <span class="badge muted">Muted</span></div>
+              <div class="meta">Local • <span id="localBadge" class="badge muted">Muted</span></div>
             </div>
           </div>
 
-          <!-- dynamic remote tiles appended here by your main.js -->
+          <!-- dynamic remote tiles appended here by main.js -->
         </div>
 
         <div class="log">
@@ -57,9 +57,25 @@
         <div class="card">
           <h3>Participants</h3>
           <ul id="participantsList" class="participants">
-            <!-- Optionally fill by main.js using existing-peers/new-peer -->
             <li class="placeholder">No participants yet</li>
           </ul>
+        </div>
+
+        <div class="card">
+          <h3>Live Transcript</h3>
+          <div id="transcriptBox" style="max-height:200px;overflow:auto;font-size:13px;"></div>
+        </div>
+
+        <div class="card">
+          <h3>Summary & Action Items</h3>
+          <button id="summarizeBtn" class="btn outline">Generate Summary</button>
+          <div id="summaryBox" style="white-space:pre-wrap;font-size:13px;margin-top:8px;"></div>
+        </div>
+
+        <div class="card small">
+          <h4>Quick Metrics</h4>
+          <div>Network Mode: <strong id="netMode">normal</strong></div>
+          <div>Attention: <strong id="attScore">—</strong></div>
         </div>
 
         <div class="card small">

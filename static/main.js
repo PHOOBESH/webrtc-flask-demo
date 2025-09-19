@@ -1,19 +1,17 @@
-// static/main.js — multi-peer mesh client (updated: creates CSS-friendly tiles + participants list)
+// static/main.js — extended: transcription streaming, summarizer, adaptation, attention
 document.addEventListener('DOMContentLoaded', () => {
   const socket = io();
   const pcs = {};              // map: remoteSid -> RTCPeerConnection
   let localStream = null;
   let joined = false;
   let room = null;
-  let statsInterval = null;
-  let prevPacketsReceived = 0;
-  let prevPacketsLost = 0;
+  const statsIntervals = {};   // map remoteSid -> interval id
+  let recorder = null;
 
-  // ICE config: STUN + TURN (replace with your reliable TURN provider)
+  // ICE config: STUN + TURN (replace with your TURN provider for production)
   const config = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
-      // Example public relay (for testing). Replace with Xirsys/coturn creds for reliability.
       {
         urls: 'turn:openrelay.metered.ca:443',
         username: 'openrelayproject',
@@ -22,7 +20,7 @@ document.addEventListener('DOMContentLoaded', () => {
     ]
   };
 
-  // DOM (note: remotesGrid matches new HTML)
+  // DOM
   const joinBtn = document.getElementById('joinBtn');
   const leaveBtn = document.getElementById('leaveBtn');
   const roomInput = document.getElementById('roomInput');
@@ -32,26 +30,28 @@ document.addEventListener('DOMContentLoaded', () => {
   const rttEl = document.getElementById('rtt');
   const plEl = document.getElementById('pl');
   const debugEl = document.getElementById('debug');
+  const transcriptBox = document.getElementById('transcriptBox');
+  const summarizeBtn = document.getElementById('summarizeBtn');
+  const summaryBox = document.getElementById('summaryBox');
+  const netModeEl = document.getElementById('netMode');
+  const attScoreEl = document.getElementById('attScore');
+  const localBadge = document.getElementById('localBadge');
 
-  // helper logs
-  function clog(...a){ console.log('[APP]', ...a); }
+  function clog(...a){ console.log('[APP]', ...a); debugEl.innerText = debugEl.innerText + a.join(' ') + '\n'; }
 
-  // --- socket handlers ---
+  // Socket handlers
   socket.on('connect', () => {
     clog('socket connected', socket.id);
     joinBtn.disabled = false;
   });
 
-  // Receive initial list of existing peers (optional)
   socket.on('existing-peers', (data) => {
     clog('existing peers', data.peers);
-    // optionally populate participants list
     if (Array.isArray(data.peers)) {
       data.peers.forEach(p => addParticipant(p));
     }
   });
 
-  // New peer joined -> we should create pc and offer to them
   socket.on('new-peer', async (data) => {
     const newSid = data.peer;
     clog('new-peer -> create offer to', newSid);
@@ -59,7 +59,6 @@ document.addEventListener('DOMContentLoaded', () => {
     await createPeerAndOffer(newSid);
   });
 
-  // Offer received from another peer
   socket.on('offer', async (data) => {
     const from = data.from;
     const sdp = data.sdp;
@@ -69,7 +68,7 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     } catch (e) {
-      console.error('setRemoteDescription failed', e);
+      clog('setRemoteDescription failed', e);
       return;
     }
 
@@ -102,7 +101,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Answer for an offer we sent
   socket.on('answer', async (data) => {
     const from = data.from;
     const sdp = data.sdp;
@@ -119,7 +117,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // ICE candidate routing
   socket.on('ice-candidate', async (data) => {
     const from = data.from;
     const candidate = data.candidate;
@@ -133,7 +130,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Peer left -> remove UI and pc
   socket.on('peer-left', (data) => {
     const sid = data.sid;
     clog('peer-left', sid);
@@ -141,16 +137,27 @@ document.addEventListener('DOMContentLoaded', () => {
     removeParticipant(sid);
   });
 
-  // --- UI handlers ---
+  // transcript updates from server
+  socket.on('transcript-update', (data) => {
+    const entry = data.entry;
+    const p = document.createElement('p');
+    const ts = entry.ts ? new Date(entry.ts * 1000) : new Date();
+    p.innerText = `[${ts.toLocaleTimeString()}] ${entry.text}`;
+    transcriptBox.appendChild(p);
+    transcriptBox.scrollTop = transcriptBox.scrollHeight;
+  });
+
+  // Join room
   joinBtn.onclick = async () => {
     if (joined) return;
     room = (roomInput.value || 'default').trim();
 
-    // get local stream proactively
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
       localVideo.srcObject = localStream;
       leaveBtn.disabled = false;
+      localBadge.innerText = 'Live';
+      localBadge.classList.remove('muted');
     } catch (e) {
       alert('Camera/mic required: ' + e.message);
       return;
@@ -161,10 +168,14 @@ document.addEventListener('DOMContentLoaded', () => {
     joinBtn.disabled = true;
     clog('joined', room);
 
-    // mark self in participants list
+    // Add local participant row
     addParticipant('you', { label: 'You', self: true });
+
+    // Start streaming audio chunks for transcription
+    startAudioStreaming();
   };
 
+  // Leave room
   leaveBtn.onclick = () => {
     if (!joined) return;
     socket.emit('leave', { room });
@@ -178,11 +189,15 @@ document.addEventListener('DOMContentLoaded', () => {
     joined = false;
     joinBtn.disabled = false;
     leaveBtn.disabled = true;
-    // remove participants (except 'you' entry if desired)
     clearParticipants();
+    transcriptBox.innerHTML = '';
+    summaryBox.innerText = '';
+    stopAudioStreaming();
+    localBadge.innerText = 'Muted';
+    localBadge.classList.add('muted');
   };
 
-  // --- Peer connection helpers ---
+  // Peer connection helpers
   function createPeerConnectionFor(remoteSid) {
     const pc = new RTCPeerConnection(config);
     pcs[remoteSid] = pc;
@@ -229,31 +244,25 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // --- UI: create tiles & participants list (matches CSS) ---
+  // Attach remote stream into a tile
   function attachRemoteStream(remoteSid, stream) {
-    // ensure wrapper exists and has classes that match style.css
     let wrapper = document.getElementById('wrap_' + remoteSid);
     let vid;
     if (!wrapper) {
       wrapper = document.createElement('div');
       wrapper.id = 'wrap_' + remoteSid;
       wrapper.className = 'video-tile';
-      // create video element
       vid = document.createElement('video');
       vid.id = 'remote_' + remoteSid;
       vid.autoplay = true;
       vid.playsInline = true;
-      // append video
       wrapper.appendChild(vid);
 
-      // tile footer
       const footer = document.createElement('div');
       footer.className = 'tile-footer';
-      // name
       const nameDiv = document.createElement('div');
       nameDiv.className = 'name';
       nameDiv.innerText = `Peer: ${shortId(remoteSid)}`;
-      // meta (badge)
       const metaDiv = document.createElement('div');
       metaDiv.className = 'meta';
       const badge = document.createElement('span');
@@ -265,20 +274,15 @@ document.addEventListener('DOMContentLoaded', () => {
       footer.appendChild(metaDiv);
       wrapper.appendChild(footer);
 
-      // append to grid (after local tile)
       remotesGrid.appendChild(wrapper);
-
-      // add participant entry
       addParticipant(remoteSid);
     } else {
       vid = document.getElementById('remote_' + remoteSid);
     }
 
-    // set stream
     try {
       vid.srcObject = stream;
     } catch (e) {
-      // fallback: create object URL (older browsers)
       vid.src = URL.createObjectURL(stream);
     }
   }
@@ -289,7 +293,6 @@ document.addEventListener('DOMContentLoaded', () => {
       try { pc.close(); } catch(e) {}
       delete pcs[remoteSid];
     }
-    // clear interval if exists
     if (statsIntervals[remoteSid]) {
       clearInterval(statsIntervals[remoteSid]);
       delete statsIntervals[remoteSid];
@@ -298,15 +301,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (wrapper) wrapper.remove();
   }
 
-  // --- Participants list utilities ---
+  // Participants list utils
   function addParticipant(id, opts = {}) {
-    // opts: { label: string, self: bool }
     if (!participantsList) return;
-    // Remove placeholder if present
     const placeholder = participantsList.querySelector('.placeholder');
     if (placeholder) placeholder.remove();
-
-    // Avoid duplicate entry
     if (document.getElementById('part_' + id)) return;
 
     const li = document.createElement('li');
@@ -335,7 +334,6 @@ document.addEventListener('DOMContentLoaded', () => {
   function removeParticipant(id) {
     const el = document.getElementById('part_' + id);
     if (el) el.remove();
-    // if list empty, add placeholder
     if (participantsList.children.length === 0) {
       const p = document.createElement('li');
       p.className = 'placeholder';
@@ -352,15 +350,12 @@ document.addEventListener('DOMContentLoaded', () => {
     participantsList.appendChild(p);
   }
 
-  // --- small helpers ---
   function shortId(id) {
     if (!id) return '';
     return id.length > 8 ? id.slice(0,8) : id;
   }
 
-  // --------- Basic stats per connection (optional) ----------
-  const statsIntervals = {}; // map remoteSid -> interval
-
+  // Stats & adaptation: start per peer
   function startStatsFor(remoteSid) {
     if (statsIntervals[remoteSid]) return;
     const pc = pcs[remoteSid];
@@ -379,8 +374,129 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       });
       rttEl.innerText = rttMs ? Math.round(rttMs) : '—';
-      debugEl.innerText = `peer ${shortId(remoteSid)} inbound:${packetsReceived} lost:${packetsLost}`;
-    }, 1000);
+      const lossPct = packetsReceived + packetsLost ? Math.round((packetsLost / (packetsReceived + packetsLost)) * 10000)/100 : 0;
+      plEl.innerText = lossPct ? lossPct + '%' : '—';
+      // Call adaptation endpoint
+      checkNetworkAdaptation(rttMs || 0, packetsLost / (packetsReceived + packetsLost + 0.001));
+    }, 3000);
   }
+
+  // Adaptation backend call: /adapt
+  async function checkNetworkAdaptation(rtt, packetLoss, bandwidth = 600) {
+    try {
+      const res = await fetch('/adapt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rtt, packetLoss, bandwidth })
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      netModeEl.innerText = data.mode || 'normal';
+
+      // enact local adaptation decisions
+      if (!localStream) return;
+      if (data.mode === 'degrade-video') {
+        localStream.getVideoTracks().forEach(t => {
+          try { t.applyConstraints({ frameRate: 10, height: 240 }); } catch(e){ clog('constraint apply failed', e); }
+        });
+      } else if (data.mode === 'audio-only') {
+        localStream.getVideoTracks().forEach(t => t.enabled = false);
+      } else if (data.mode === 'captions-only') {
+        // stop all tracks but keep recorder for transcription if needed
+        localStream.getTracks().forEach(t => t.stop());
+      } else {
+        // normal: ensure video enabled
+        localStream.getVideoTracks().forEach(t => t.enabled = true);
+      }
+    } catch (e) {
+      console.warn('adaptation check failed', e);
+    }
+  }
+
+  // Summarizer: POST /summarize
+  summarizeBtn.onclick = async () => {
+    if (!room) return alert('Join a room first');
+    summaryBox.innerText = 'Generating summary...';
+    try {
+      const res = await fetch('/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room })
+      });
+      if (!res.ok) {
+        summaryBox.innerText = 'Summary failed';
+        return;
+      }
+      const data = await res.json();
+      const s = data.result && data.result.summary ? data.result.summary : (data.result || 'No summary');
+      summaryBox.innerText = s;
+    } catch (e) {
+      summaryBox.innerText = 'Summary error: ' + e.message;
+    }
+  };
+
+  // Attention poll (GET /attention/<socket.id>)
+  async function pollAttention() {
+    if (!room) return;
+    try {
+      const res = await fetch(`/attention/${socket.id}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const score = data.attention && (data.attention.score || data.attention.score === 0) ? data.attention.score : null;
+      attScoreEl.innerText = score !== null ? Math.round(score * 100) + '%' : '—';
+    } catch (e) {}
+  }
+  setInterval(pollAttention, 5000);
+
+  // Audio streaming for transcription: MediaRecorder to server via socket.io "audio-chunk"
+  function startAudioStreaming() {
+    if (!localStream) return;
+    try {
+      const audioStream = new MediaStream(localStream.getAudioTracks());
+      recorder = new MediaRecorder(audioStream, { mimeType: 'audio/webm' });
+    } catch (e) {
+      clog('MediaRecorder init failed', e);
+      return;
+    }
+
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const b64 = reader.result.split(',')[1];
+          socket.emit('audio-chunk', { room, b64, ts: Math.floor(Date.now()/1000) });
+        };
+        reader.readAsDataURL(e.data);
+      }
+    };
+
+    recorder.onerror = (ev) => clog('recorder error', ev);
+    recorder.start(3000); // emit every 3s
+    clog('audio streaming started');
+  }
+
+  function stopAudioStreaming() {
+    try {
+      if (recorder && recorder.state !== 'inactive') recorder.stop();
+      recorder = null;
+      clog('audio streaming stopped');
+    } catch (e) { clog('stopAudioStreaming err', e); }
+  }
+
+  // Utility to stop everything & cleanup
+  function stopAll() {
+    stopAudioStreaming();
+    Object.keys(pcs).forEach(removePeer);
+    if (localStream) {
+      localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+      localVideo.srcObject = null;
+    }
+    transcriptBox.innerHTML = '';
+    summaryBox.innerText = '';
+  }
+
+  // Exported helpers (for debug)
+  window._agamai = { pcs, stopAll };
 
 });
