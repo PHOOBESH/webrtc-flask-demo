@@ -3,120 +3,136 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AgamAI — Multi-Party Call</title>
+  <title>AgamAI — Multi-party Call (Demo)</title>
   <link rel="stylesheet" href="/static/style.css">
+  <style>
+    /* Minimal inline style for demo clarity (you can keep your style.css) */
+    body { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin:0; background:#0b1020; color:#e6eef8; }
+    .topbar { display:flex; justify-content:space-between; align-items:center; padding:12px 20px; background:#071025; border-bottom:1px solid rgba(255,255,255,0.03); }
+    .brand .title { font-weight:700; font-size:16px; }
+    .main { display:flex; gap:12px; padding:16px; height:calc(100vh - 120px); box-sizing:border-box; }
+    .stage { flex:1; background:#081024; border-radius:8px; padding:12px; display:flex; flex-direction:column; }
+    .sidebar { width:340px; display:flex; flex-direction:column; gap:12px; }
+    .video-grid { display:grid; grid-template-columns: repeat(2, 1fr); gap:10px; align-items:stretch; }
+    .video-tile { background:#071024; border-radius:8px; overflow:hidden; position:relative; min-height:160px; display:flex; flex-direction:column; }
+    video { width:100%; height:100%; object-fit:cover; background:#000; }
+    .tile-footer { padding:8px; display:flex; justify-content:space-between; align-items:center; background:linear-gradient(180deg, transparent, rgba(0,0,0,0.45)); position:absolute; bottom:0; left:0; right:0; color:#cfe7ff; font-size:13px; }
+    .card { background:#081229; padding:12px; border-radius:8px; }
+    .participants { list-style:none; padding:0; margin:0; max-height:160px; overflow:auto; }
+    .participants li { padding:8px 6px; border-bottom:1px dashed rgba(255,255,255,0.02); display:flex; justify-content:space-between; align-items:center; }
+    .attention-badge { margin-left:10px; font-weight:700; color:#7fffd4; }
+    #debug { height:120px; background:#03101a; overflow:auto; padding:8px; border-radius:6px; color:#9fb6d9; }
+    .controls { display:flex; gap:8px; align-items:center; }
+    .btn { padding:8px 10px; border-radius:6px; background:#0b6b94; color:white; border:none; cursor:pointer; }
+    .btn.outline { background:transparent; border:1px solid rgba(255,255,255,0.06); }
+    .room-input { padding:8px; border-radius:6px; background:#031827; border:1px solid rgba(255,255,255,0.03); color:#e6eef8; }
+    .badge.muted { background:#223344; padding:4px 8px; border-radius:12px; color:#9fb6d9; }
+    .badge { background:#0b6b94; padding:4px 8px; border-radius:12px; color:white; font-size:12px; }
+    .small { font-size:12px; color:#9fb6d9; }
+  </style>
 </head>
 <body>
-  <div class="app">
-    <header class="topbar">
-      <div class="brand">
-        <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 12a9 9 0 1118 0 9 9 0 01-18 0zm9-5a1 1 0 000 2 3 3 0 013 3 1 1 0 002 0 5 5 0 00-5-5z"/></svg>
-        <div>
-          <div class="title">AgamAI Labs</div>
-          <div class="subtitle">Real-time Collaboration — Multi-party (mesh)</div>
+  <header class="topbar">
+    <div class="brand">
+      <div class="title">AgamAI Labs — Live Demo</div>
+      <div class="small">Adaptive meetings • Real-time MOM • Engagement</div>
+    </div>
+
+    <div class="controls">
+      <input id="roomInput" class="room-input" placeholder="room name" value="testroom" />
+      <button id="joinBtn" class="btn">Join</button>
+      <button id="leaveBtn" class="btn outline" disabled>Leave</button>
+    </div>
+  </header>
+
+  <main class="main">
+    <section class="stage">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <div style="font-size:16px;font-weight:700;">Call Stage</div>
+        <div style="display:flex;gap:12px;align-items:center;font-size:13px;">
+          <div id="connectionStatus">Status: idle</div>
+          <div>RTT: <strong id="rtt">—</strong> ms</div>
+          <div>Loss: <strong id="pl">—</strong></div>
+          <div>Mode: <strong id="netMode">auto</strong></div>
         </div>
       </div>
 
-      <div class="actions">
-        <input id="roomInput" class="room-input" placeholder="room name" value="testroom" aria-label="Room name" />
-        <button id="joinBtn" class="btn primary">Join</button>
-        <button id="leaveBtn" class="btn outline" disabled>Leave</button>
+      <div id="remotesGrid" class="video-grid">
+        <div id="wrap_local" class="video-tile">
+          <video id="localVideo" autoplay muted playsinline></video>
+          <div class="tile-footer">
+            <div class="name">You</div>
+            <div class="meta"><span id="localBadge" class="badge muted">Muted</span></div>
+          </div>
+        </div>
       </div>
-    </header>
 
-    <main class="main">
-      <section class="stage">
-        <div class="grid-header">
-          <h2>Call Stage</h2>
-          <div class="stats">
-            <span>RTT: <strong id="rtt">—</strong> ms</span>
-            <span>Packet loss: <strong id="pl">—</strong> %</span>
-          </div>
-        </div>
-
-        <!-- Responsive grid: local + remotes -->
-        <div id="remotesGrid" class="video-grid" aria-live="polite">
-          <!-- Local tile -->
-          <div id="wrap_local" class="video-tile local-tile">
-            <video id="localVideo" autoplay muted playsinline></video>
-            <div class="tile-footer">
-              <div class="name">You</div>
-              <div class="meta">Local • <span id="localBadge" class="badge muted">Muted</span></div>
-            </div>
-          </div>
-
-          <!-- dynamic remote tiles appended here by main.js -->
-        </div>
-
-        <div class="log">
-          <pre id="debug" aria-hidden="false"></pre>
-        </div>
-      </section>
-
-      <aside class="sidebar">
+      <div style="margin-top:10px;">
         <div class="card">
-          <h3>Participants</h3>
-          <ul id="participantsList" class="participants">
-            <li class="placeholder">No participants yet</li>
-          </ul>
-        </div>
-
-        <div class="card">
-          <h3>Live Transcript</h3>
-          <div id="transcriptBox" style="max-height:200px;overflow:auto;font-size:13px;"></div>
-        </div>
-
-        <div class="card">
-          <h3>Summary & Action Items</h3>
-          <button id="summarizeBtn" class="btn outline">Generate Summary</button>
-          <div id="summaryBox" style="white-space:pre-wrap;font-size:13px;margin-top:8px;"></div>
-        </div>
-
-        <!-- NETWORK SIMULATOR (demo control) -->
-        <div class="card">
-          <h3>Network Simulator</h3>
-          <div style="display:flex;gap:8px;align-items:center;">
-            <label for="netSimRange" style="font-size:13px;">Quality</label>
-            <input id="netSimRange" type="range" min="0" max="3" step="1" value="0" style="flex:1;">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div style="font-weight:700">Debug Log</div>
+            <div class="small">Useful for demo troubleshooting</div>
           </div>
-          <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:13px;">
-            <small>0 Normal</small><small>1 ↓Video</small><small>2 Audio</small><small>3 Captions</small>
-          </div>
-          <div style="margin-top:10px; display:flex; gap:8px;">
-            <button id="applySimBtn" class="btn">Apply Sim</button>
-            <button id="clearSimBtn" class="btn outline">Clear</button>
-          </div>
+          <pre id="debug"></pre>
         </div>
+      </div>
+    </section>
 
-        <!-- Attention (stable) -->
-        <div class="card">
-          <h3>Attention Meter</h3>
-          <div style="display:flex;align-items:center;gap:12px;">
-            <div id="attMeter" style="width:140px;height:12px;background:#0b1020;border-radius:8px;overflow:hidden;">
-              <div id="attMeterFill" style="width:0%;height:100%;background:linear-gradient(90deg,#6ee7b7,#06b6d4);"></div>
-            </div>
-            <div style="min-width:48px;text-align:right;font-weight:600;" id="attScoreText">—</div>
+    <aside class="sidebar">
+      <div class="card">
+        <h4>Participants</h4>
+        <ul id="participantsList" class="participants">
+          <li class="placeholder">No participants yet</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h4>Live Transcript</h4>
+        <div id="transcriptBox" style="max-height:160px;overflow:auto;font-size:13px;color:#d8eefc;"></div>
+      </div>
+
+      <div class="card">
+        <h4>Summary</h4>
+        <button id="summarizeBtn" class="btn outline">Generate Summary</button>
+        <div id="summaryBox" style="margin-top:8px; white-space:pre-wrap; color:#d8eefc;"></div>
+      </div>
+
+      <div class="card">
+        <h4>Network Simulator (demo)</h4>
+        <input id="netSimSlider" type="range" min="0" max="3" step="1" value="0" style="width:100%;">
+        <div style="display:flex;justify-content:space-between;font-size:12px;margin-top:6px;color:#9fb6d9;">
+          <span>0 Normal</span><span>1 ↓Video</span><span>2 Audio</span><span>3 Captions</span>
+        </div>
+        <div style="margin-top:8px;font-size:12px;color:#9fb6d9;">Use slider to simulate poor network during demo</div>
+      </div>
+
+      <div class="card">
+        <h4>Attention</h4>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div id="attMeter" style="width:140px;height:12px;background:#03131a;border-radius:8px;overflow:hidden;">
+            <div id="attMeterFill" style="width:0%;height:100%;background:linear-gradient(90deg,#6ee7b7,#06b6d4);"></div>
           </div>
-          <small style="color:#9aa3b2">Smoothed speaking activity (demo)</small>
+          <div id="attScoreText" style="font-weight:700">—</div>
         </div>
+        <div class="small" style="margin-top:8px;color:#9fb6d9;">Smoothed speaking activity (updates every 5s)</div>
+      </div>
 
-        <div class="card small">
-          <h4>Quick Tips</h4>
-          <ul class="tips">
-            <li>Use same room name to join peers.</li>
-            <li>TURN required for cross-network connectivity.</li>
-            <li>Use headset for better audio.</li>
-          </ul>
-        </div>
-      </aside>
-    </main>
+      <div class="card small">
+        <h5>Tips</h5>
+        <ul style="padding-left:18px;color:#9fb6d9">
+          <li>Open same room on two devices to test multi-peer.</li>
+          <li>Use slider to showcase adaptation pipeline.</li>
+          <li>Click Generate Summary after some transcript appears.</li>
+        </ul>
+      </div>
+    </aside>
+  </main>
 
-    <footer class="footer">
-      <div>© AgamAI Labs — Hackathon Demo</div>
-      <div class="links"><a href="#" target="_blank">Docs</a> · <a href="#" target="_blank">Source</a></div>
-    </footer>
-  </div>
+  <footer style="padding:12px 20px; color:#9fb6d9; font-size:13px;">
+    © AgamAI Labs — Hackathon Demo
+  </footer>
 
+  <!-- Socket.io + main.js -->
   <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
   <script src="/static/main.js" defer></script>
 </body>
