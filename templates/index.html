@@ -72,10 +72,32 @@
           <div id="summaryBox" style="white-space:pre-wrap;font-size:13px;margin-top:8px;"></div>
         </div>
 
-        <div class="card small">
-          <h4>Quick Metrics</h4>
-          <div>Network Mode: <strong id="netMode">normal</strong></div>
-          <div>Attention: <strong id="attScore">—</strong></div>
+        <!-- NETWORK SIMULATOR (demo control) -->
+        <div class="card">
+          <h3>Network Simulator</h3>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <label for="netSimRange" style="font-size:13px;">Quality</label>
+            <input id="netSimRange" type="range" min="0" max="3" step="1" value="0" style="flex:1;">
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:13px;">
+            <small>0 Normal</small><small>1 ↓Video</small><small>2 Audio</small><small>3 Captions</small>
+          </div>
+          <div style="margin-top:10px; display:flex; gap:8px;">
+            <button id="applySimBtn" class="btn">Apply Sim</button>
+            <button id="clearSimBtn" class="btn outline">Clear</button>
+          </div>
+        </div>
+
+        <!-- Attention (stable) -->
+        <div class="card">
+          <h3>Attention Meter</h3>
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div id="attMeter" style="width:140px;height:12px;background:#0b1020;border-radius:8px;overflow:hidden;">
+              <div id="attMeterFill" style="width:0%;height:100%;background:linear-gradient(90deg,#6ee7b7,#06b6d4);"></div>
+            </div>
+            <div style="min-width:48px;text-align:right;font-weight:600;" id="attScoreText">—</div>
+          </div>
+          <small style="color:#9aa3b2">Smoothed speaking activity (demo)</small>
         </div>
 
         <div class="card small">
