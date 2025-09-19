@@ -1,301 +1,298 @@
 // static/main.js
-// Resilient WebRTC client with deterministic join/leave behavior
+// WebRTC + SocketIO client for 2-participant demo
+// Replace or adapt selectors to your HTML if needed.
 
-const socket = io({ transports: ['websocket'], reconnectionAttempts: 5, reconnectionDelay: 1000 });
-
+const socket = io(); // assumes socket.io client script is loaded
 let pc = null;
 let localStream = null;
-let room = null;
-let isInitiator = false;
+let roomName = null;
 let statsInterval = null;
-let prevPacketsReceived = 0;
-let prevPacketsLost = 0;
-let remotePresent = false;
-let remoteSid = null;
-let joined = false; // whether user intentionally joined
 
-const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+// UI elements
+const joinBtn = document.querySelector('#joinBtn') || document.querySelector('button:contains("Join")');
+const leaveBtn = document.querySelector('#leaveBtn') || document.querySelector('button:contains("Leave")');
+const roomInput = document.querySelector('#roomInput') || document.querySelector('input[placeholder="room name"]');
+const localVideo = document.querySelector('#localVideo') || document.querySelector('video#local');
+const remoteVideo = document.querySelector('#remoteVideo') || document.querySelector('video#remote');
+const rttEl = document.querySelector('#rtt') || document.querySelector('#rtt') || document.createElement('div');
+const lossEl = document.querySelector('#loss') || document.createElement('div');
+const logEl = document.querySelector('#log') || document.createElement('pre');
 
-const joinBtn = document.getElementById('joinBtn');
-const leaveBtn = document.getElementById('leaveBtn');
-const roomInput = document.getElementById('roomInput');
-const debugEl = document.getElementById('debug');
+function log(...args) {
+  console.log(...args);
+  try {
+    logEl.textContent += args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ') + '\n';
+  } catch (e) {}
+}
 
-/////////////////////
-// UI Handlers
-/////////////////////
-joinBtn.onclick = async () => {
-  // Close any existing peer connection to avoid duplicate negotiation
+// ---- ICE config ----
+// Try to fetch TURN credentials from server; fallback to public test TURN
+async function getIceConfig() {
+  // default STUN
+  const base = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+  try {
+    const res = await fetch('/turn-credentials');
+    if (res.ok) {
+      const data = await res.json();
+      log('[TURN] got credentials', data);
+      const turnServers = data.uris.map(uri => ({
+        urls: uri,
+        username: data.username,
+        credential: data.credential
+      }));
+      return { iceServers: [...base, ...turnServers] };
+    } else {
+      log('[TURN] /turn-credentials not available, using fallback TURN', res.status);
+    }
+  } catch (e) {
+    log('[TURN] fetch error (ok if not configured):', e);
+  }
+
+  // Fallback public test TURN (limited reliability) — only for quick testing, replace with your own for production
+  const fallbackTurn = [
+    { urls: 'turn:relay.metered.ca:80', username: 'openai', credential: 'openai123' },
+    { urls: 'turn:relay.metered.ca:443', username: 'openai', credential: 'openai123' }
+  ];
+  return { iceServers: [...base, ...fallbackTurn] };
+}
+
+// ---- Media / PeerConnection helpers ----
+async function startLocalStream() {
+  if (localStream) return;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    if (localVideo) localVideo.srcObject = localStream;
+    log('[MEDIA] Local stream started');
+  } catch (err) {
+    log('[MEDIA] getUserMedia error:', err);
+    alert('Camera / mic access required. Check permissions.');
+    throw err;
+  }
+}
+
+async function createPeerConnection() {
   if (pc) {
-    console.log('[UI] closing existing peer before re-join');
-    pc.close();
-    pc = null;
+    log('[PC] existing pc exists - closing it first');
+    stopPeerConnection();
   }
 
-  room = (roomInput.value || 'default').trim();
-  console.log('[UI] Join clicked -> room=', room);
-  socket.emit('join', { room });
-  joinBtn.disabled = true;   // re-enabled on leave or error
-  // mark intent; server will confirm with 'created' or 'ready'
-  joined = true;
-};
+  const cfg = await getIceConfig();
+  log('[PC] creating RTCPeerConnection with config', cfg);
+  pc = new RTCPeerConnection(cfg);
 
-leaveBtn.onclick = () => {
-  if (!joined) return;
-  if (room) {
-    console.log('[UI] Leave clicked -> notifying server');
-    socket.emit('leave', { room });
+  // add local tracks
+  if (localStream) {
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
+    }
   }
-  // clear joined state and room
-  joined = false;
-  room = null;
-  // stop only local resources for the leaver
-  stopCall();
-  joinBtn.disabled = false;
-};
 
-/////////////////////
-// Socket handlers
-/////////////////////
-socket.on('connect', () => {
-  console.log('[SOCKET] connected', socket.id);
-  console.log('[SOCKET] joined flag=', joined, '(no auto-join will happen)');
-});
+  // event handlers
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      log('[PC] onicecandidate -> sending candidate', e.candidate);
+      socket.emit('ice-candidate', { candidate: e.candidate, room: roomName });
+    } else {
+      log('[PC] onicecandidate: null (all candidates sent)');
+    }
+  };
 
-// do NOT auto re-join on reconnect; user must click Join
-socket.on('disconnect', (reason) => {
-  console.log('[SOCKET] disconnected', reason);
-});
+  pc.ontrack = (e) => {
+    log('[PC] ontrack', e);
+    // put remote stream into video element
+    if (remoteVideo) {
+      // prefer using e.streams[0] if available
+      if (e.streams && e.streams[0]) {
+        remoteVideo.srcObject = e.streams[0];
+      } else {
+        // fallback: build stream from tracks
+        const inboundStream = new MediaStream();
+        inboundStream.addTrack(e.track);
+        remoteVideo.srcObject = inboundStream;
+      }
+    }
+  };
 
-socket.on('created', async () => {
-  console.log('[SIGNAL] created -> you are initiator');
-  isInitiator = true;
-  joined = true; // server confirmed
-  if (!localStream) await startLocalStream();
-});
+  pc.onconnectionstatechange = () => {
+    log('[PC] connectionState:', pc.connectionState);
+    if (pc.connectionState === 'failed') {
+      log('[PC] connection failed, trying to restart ICE');
+      pc.restartIce && pc.restartIce();
+    }
+  };
 
-socket.on('ready', async () => {
-  console.log('[SIGNAL] ready -> peers present');
-  joined = true;
-  if (!localStream) await startLocalStream();
-  if (isInitiator) {
-    createPeerConnection();
-    if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  pc.oniceconnectionstatechange = () => {
+    log('[PC] iceConnectionState:', pc.iceConnectionState);
+    if (pc.iceConnectionState === 'disconnected') {
+      // might indicate remote left or network hiccup
+      log('[PC] ICE disconnected');
+    }
+  };
+
+  // stats polling
+  if (statsInterval) clearInterval(statsInterval);
+  statsInterval = setInterval(async () => {
+    if (!pc) return;
     try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      console.log('[SIGNAL] sending offer');
-      socket.emit('offer', { sdp: pc.localDescription, room });
-    } catch (e) { console.error('[ERROR] Offer creation', e); }
+      const stats = await pc.getStats(null);
+      parseAndShowStats(stats);
+    } catch (e) {
+      // ignore
+    }
+  }, 2000);
+
+  return pc;
+}
+
+function stopPeerConnection() {
+  if (!pc) return;
+  try {
+    pc.getSenders().forEach(s => {
+      if (s.track) s.track.stop();
+    });
+  } catch (e) {}
+
+  try {
+    pc.close();
+  } catch (e) {}
+  pc = null;
+  if (statsInterval) {
+    clearInterval(statsInterval);
+    statsInterval = null;
+  }
+  if (remoteVideo) remoteVideo.srcObject = null;
+}
+
+// parse basic stats (RTT, packet loss)
+function parseAndShowStats(stats) {
+  let rtt = null;
+  let inboundPackets = 0, inboundLost = 0;
+  stats.forEach(report => {
+    if (report.type === 'candidate-pair' && report.currentRoundTripTime !== undefined) {
+      rtt = Math.round(report.currentRoundTripTime * 1000);
+    }
+    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+      inboundPackets = report.packetsReceived || 0;
+      inboundLost = report.packetsLost || 0;
+    }
+  });
+  if (rttEl) rttEl.textContent = `RTT: ${rtt !== null ? rtt + ' ms' : '— ms'}`;
+  if (lossEl) lossEl.textContent = `Packet loss: ${inboundPackets ? ((inboundLost / (inboundPackets + inboundLost)) * 100).toFixed(1) + '%' : '— %'}`;
+  log(`[STATS] rtt=${rtt} inbound_packets=${inboundPackets}, lost=${inboundLost}`);
+}
+
+// ---- Signaling flow ----
+async function joinRoom() {
+  roomName = (roomInput && roomInput.value) ? roomInput.value : 'default';
+  if (!roomName) {
+    alert('Enter a room name');
+    return;
+  }
+  log('[SIGNAL] joining', roomName);
+  await startLocalStream();
+  socket.emit('join', { room: roomName });
+  // disable join button
+  if (joinBtn) joinBtn.disabled = true;
+}
+
+async function leaveRoom() {
+  log('[SIGNAL] leaving', roomName);
+  try {
+    socket.emit('leave', { room: roomName });
+  } catch (e) {}
+  stopPeerConnection();
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
+  if (joinBtn) joinBtn.disabled = false;
+  if (leaveBtn) leaveBtn.disabled = true;
+  roomName = null;
+}
+
+socket.on('connect', () => {
+  log('[SOCKET] connected', socket.id);
+});
+
+socket.on('peer-joined', async (data) => {
+  log('[SOCKET] peer-joined', data);
+  // When a peer joins, this client should create an offer (if we have started local stream)
+  try {
+    await createPeerConnection();
+    // create offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    log('[SOCKET] sending offer', offer);
+    socket.emit('offer', { sdp: offer, room: roomName });
+  } catch (e) {
+    log('[ERROR] peer-joined flow', e);
   }
 });
 
 socket.on('offer', async (data) => {
-  console.log('[SIGNAL] received offer');
-  // Only answer offers if user intentionally joined
-  if (!joined) {
-    console.warn('[SIGNAL] offer received but user not joined; ignoring');
-    return;
-  }
-  if (!localStream) await startLocalStream();
-  if (!pc) createPeerConnection();
-  if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  log('[SOCKET] received offer', data);
   try {
+    await createPeerConnection();
     await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    console.log('[SIGNAL] sending answer');
-    socket.emit('answer', { sdp: pc.localDescription, room });
-  } catch (e) { console.error('[ERROR] Answer creation', e); }
+    log('[SOCKET] sending answer', answer);
+    socket.emit('answer', { sdp: answer, room: roomName });
+  } catch (e) {
+    log('[ERROR] handling offer', e);
+  }
 });
 
 socket.on('answer', async (data) => {
-  console.log('[SIGNAL] received answer');
+  log('[SOCKET] received answer', data);
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-  } catch (e) { console.error('[ERROR] Set remote desc', e); }
+  } catch (e) {
+    log('[ERROR] setRemoteDescription(answer)', e);
+  }
 });
 
 socket.on('ice-candidate', async (data) => {
-  console.log('[SIGNAL] received ICE', data && data.candidate ? 'true' : 'false');
-  if (!pc) {
-    console.warn('[SIGNAL] No RTCPeerConnection yet to add ICE');
-    return;
-  }
+  log('[SOCKET] received ice-candidate', data);
   try {
-    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-  } catch (err) {
-    console.warn('[ERROR] Adding ICE candidate', err);
+    if (data.candidate) {
+      await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      log('[PC] addIceCandidate success');
+    }
+  } catch (e) {
+    log('[ERROR] addIceCandidate', e);
   }
 });
 
-// When a peer leaves, only clear remote video and mark remote absent.
-// Do NOT stop local camera/pc — keep page live for rejoin.
 socket.on('peer-left', (data) => {
-  console.log('[SIGNAL] peer-left', data);
-  remotePresent = false;
-  remoteSid = null;
-  document.getElementById('remoteVideo').srcObject = null;
-  appendDebug(`Peer left: ${data && data.sid ? data.sid : 'unknown'}`);
+  log('[SOCKET] peer-left', data);
+  // tear down peer connection
+  stopPeerConnection();
 });
 
-/////////////////////
-// Media & Peer
-/////////////////////
-async function startLocalStream() {
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    document.getElementById('localVideo').srcObject = localStream;
-    leaveBtn.disabled = false;
-    console.log('[MEDIA] local stream started');
-  } catch (err) {
-    alert('Could not get camera/mic: ' + err.message);
-    console.error(err);
-  }
-}
+// ---- UI bindings ----
+if (joinBtn) joinBtn.addEventListener('click', async (e) => {
+  joinBtn.disabled = true;
+  leaveBtn.disabled = false;
+  await joinRoom();
+});
 
-function createPeerConnection() {
-  console.log('[PC] creating RTCPeerConnection');
-  pc = new RTCPeerConnection(config);
-
-  pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      console.log('[PC] sending ICE');
-      socket.emit('ice-candidate', { candidate: event.candidate, room });
-    }
-  };
-
-  pc.ontrack = event => {
-    console.log('[PC] ontrack event', event);
-    remotePresent = true;
-    try { remoteSid = event.streams && event.streams[0] && event.streams[0].id; } catch (e) {}
-    document.getElementById('remoteVideo').srcObject = event.streams[0];
-  };
-
-  pc.onconnectionstatechange = () => {
-  console.log('[PC] connectionState', pc.connectionState);
-  if (pc.connectionState === 'connected') {
-    startStats();
-    return;
-  }
-
-  // If the PC becomes 'failed' or 'closed' *and* a remote participant is present,
-  // that indicates a real session failure and we should stop the call.
-  // But if remotePresent is false (peer already left), don't fully stop:
-  // keep local camera on so the user can wait/rejoin without reloading.
-  if ((pc.connectionState === 'failed' || pc.connectionState === 'closed')) {
-    if (remotePresent) {
-      appendDebug(`PC state is ${pc.connectionState} with remote present -> stopping call`);
-      stopCall();
-    } else {
-      appendDebug(`PC state is ${pc.connectionState} but no remote present -> keeping local stream alive`);
-      // do not call stopCall() here; keep pc/null? we will close pc later on explicit leave
-      // Optionally: you could close pc but keep localStream; here we keep pc open so
-      // reconnection/renegotiation is possible without re-getUserMedia.
-    }
-  }
-};
-
-
-  pc.oniceconnectionstatechange = () => {
-    console.log('[PC] iceConnectionState', pc.iceConnectionState);
-    if (pc.iceConnectionState === 'disconnected') {
-      if (remotePresent) {
-        appendDebug('ICE disconnected (remote was present). Waiting for reconnection...');
-        setTimeout(() => {
-          if (pc && pc.iceConnectionState === 'disconnected') {
-            appendDebug('ICE still disconnected after timeout.');
-            // do not auto-stop here; rely on onconnectionstatechange for final action.
-          }
-        }, 5000);
-      } else {
-        appendDebug('ICE disconnected but no remote present (peer likely left).');
-        // keep pc open so user can re-invite or wait
-      }
-    }
-  };
-}
-
-/////////////////////
-// Stats
-/////////////////////
-function startStats() {
-  if (statsInterval) clearInterval(statsInterval);
-  statsInterval = setInterval(async () => {
-    if (!pc || pc.connectionState !== 'connected') return;
-    const stats = await pc.getStats();
-    parseAndShowStats(stats);
-  }, 1000);
-}
-
-function parseAndShowStats(stats) {
-  let rttMs = null;
-  let packetsReceived = 0;
-  let packetsLost = 0;
-
-  stats.forEach(report => {
-    if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-      if (report.currentRoundTripTime) rttMs = report.currentRoundTripTime * 1000;
-      if (report.roundTripTime) rttMs = report.roundTripTime * 1000;
-    }
-    if (report.type === 'inbound-rtp' && (report.kind === 'video' || !report.kind)) {
-      packetsReceived = report.packetsReceived || packetsReceived;
-      packetsLost = report.packetsLost || packetsLost;
-    }
-  });
-
-  let plPercent = '—';
-  if (prevPacketsReceived || prevPacketsLost) {
-    const dRecv = Math.max(0, (packetsReceived - prevPacketsReceived) || 0);
-    const dLost = Math.max(0, (packetsLost - prevPacketsLost) || 0);
-    const total = dRecv + dLost;
-    plPercent = total > 0 ? ((dLost / total) * 100).toFixed(1) + '%' : '0.0%';
-  }
-  prevPacketsReceived = packetsReceived;
-  prevPacketsLost = packetsLost;
-
-  document.getElementById('rtt').innerText = rttMs ? Math.round(rttMs) : '—';
-  document.getElementById('pl').innerText = plPercent;
-  document.getElementById('debug').innerText = `inbound packets: ${packetsReceived}, lost: ${packetsLost}\npc.connState: ${pc ? pc.connectionState : 'no-pc'}`;
-}
-
-/////////////////////
-// Stop / cleanup
-/////////////////////
-function stopCall(soft = false) {
-  console.log('[PC] stopping call, soft=', soft);
-  if (pc) { pc.close(); pc = null; }
-  if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-    localStream = null;
-    document.getElementById('localVideo').srcObject = null;
-  }
-  document.getElementById('remoteVideo').srcObject = null;
-  if (statsInterval) clearInterval(statsInterval);
-  prevPacketsReceived = prevPacketsLost = 0;
-  joinBtn.disabled = false;
+if (leaveBtn) leaveBtn.addEventListener('click', async (e) => {
   leaveBtn.disabled = true;
-  remotePresent = false;
-  remoteSid = null;
-  if (!soft) appendDebug('[PC] call fully stopped');
-}
-
-/////////////////////
-// Helpers
-/////////////////////
-function appendDebug(text) {
-  const d = debugEl;
-  const now = new Date().toLocaleTimeString();
-  d.innerText = (d.innerText || '') + `\n[${now}] ${text}`;
-}
-
-// clean leave when closing tab
-window.addEventListener('beforeunload', (e) => {
-  try {
-    if (joined && room) {
-      socket.emit('leave', { room });
-      joined = false;
-      room = null;
-    }
-  } catch (err) { /* ignore */ }
+  joinBtn.disabled = false;
+  await leaveRoom();
 });
+
+// auto-attach video autoplay
+if (localVideo) { localVideo.autoplay = true; localVideo.muted = true; localVideo.playsInline = true; }
+if (remoteVideo) { remoteVideo.autoplay = true; remoteVideo.playsInline = true; remoteVideo.muted = false; }
+
+// Safety: handle page unload to leave gracefully
+window.addEventListener('beforeunload', () => {
+  try { socket.emit('leave', { room: roomName }); } catch (e) {}
+  stopPeerConnection();
+});
+
+// debug helper to show logs on page if #log exists
+log('[INIT] main.js loaded');
