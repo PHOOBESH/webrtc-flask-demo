@@ -14,15 +14,7 @@ let remotePresent = false;
 let remoteSid = null;
 let joined = false; // whether user intentionally joined
 
-const config = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    // public relay for quick testing only (not for production)
-    { urls: 'turn:relay.metered.ca:80', username: 'openai', credential: 'openai123' },
-    { urls: 'turn:relay.metered.ca:443', username: 'openai', credential: 'openai123' }
-  ]
-};
-
+const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
 const joinBtn = document.getElementById('joinBtn');
 const leaveBtn = document.getElementById('leaveBtn');
